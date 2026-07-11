@@ -1,9 +1,9 @@
 """Hermes voice shim — bridges Home Assistant to Hermes Agent.
 
 Receives text from HA's custom conversation agent, routes it through
-the voice profile (which has homeassistant tools), and returns the
-response. Maintains conversation sessions per room with auto-reset
-after MAX_TURNS to prevent context bloat.
+the voice profile via one-shot mode (hermes -z), and returns the
+response. No session persistence — each call is stateless, avoiding
+context bloat and cold-start timing issues.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import subprocess
 from pathlib import Path
 
@@ -25,8 +24,6 @@ app = FastAPI(title="Hermes Voice Shim")
 
 HERMES = "/home/dshelfoon/.local/bin/hermes"
 PROFILE = "voice"
-SESSIONS_FILE = Path("/home/dshelfoon/.hermes/shim-sessions.json")
-MAX_TURNS = 20  # Auto-reset session after this many turns
 
 
 class ChatRequest(BaseModel):
@@ -36,30 +33,15 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
-    session_id: str
-    turn: int
-    max_turns: int
-    reset: bool = False
 
 
-def _load_sessions() -> dict:
-    """Load session map from disk."""
-    if SESSIONS_FILE.exists():
-        return json.loads(SESSIONS_FILE.read_text())
-    return {}
+async def _hermes_oneshot(text: str) -> str:
+    """Call hermes -z (one-shot) and return just the response text.
 
-
-def _save_sessions(sessions: dict) -> None:
-    """Save session map to disk."""
-    SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SESSIONS_FILE.write_text(json.dumps(sessions, indent=2))
-
-
-async def _hermes_chat(text: str, resume: str | None = None) -> tuple[str, str]:
-    """Call hermes chat and return (response_text, session_id)."""
-    cmd = [HERMES, "chat", "-p", PROFILE, "-q", text]
-    if resume:
-        cmd.extend(["--resume", resume])
+    One-shot mode bypasses TUI overhead — no banner, no spinner, no
+    session parsing needed. Output is the agent's final text to stdout.
+    """
+    cmd = [HERMES, "-z", text, "-p", PROFILE]
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -68,81 +50,23 @@ async def _hermes_chat(text: str, resume: str | None = None) -> tuple[str, str]:
     )
     stdout, stderr = await proc.communicate()
 
-    output = stdout.decode("utf-8", errors="replace")
-    stderr_text = stderr.decode("utf-8", errors="replace")
+    output = stdout.decode("utf-8", errors="replace").strip()
+    stderr_text = stderr.decode("utf-8", errors="replace").strip()
 
     if proc.returncode != 0:
-        _LOGGER.error("Hermes failed: %s", stderr_text)
+        _LOGGER.error("Hermes failed (code %d): %s", proc.returncode, stderr_text)
         raise RuntimeError(f"Hermes exited with code {proc.returncode}")
 
-    # Extract session ID from output footer
-    session_id = ""
-    match = re.search(r"hermes --resume (\S+)", output)
-    if match:
-        session_id = match.group(1)
-
-    # Extract response message (everything between "╭─" and "╰─")
-    lines = output.split("\n")
-    response_lines = []
-    in_response = False
-    for line in lines:
-        if "Query:" in line and not in_response:
-            continue
-        if "╭" in line:
-            in_response = True
-            continue
-        if "╰" in line:
-            break
-        if in_response:
-            response_lines.append(line)
-
-    response_text = "\n".join(response_lines).strip()
-    if not response_text:
-        response_text = output.strip().split("\n")[-1] if output.strip() else ""
-
-    return response_text, session_id
+    return output
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
-    """Process a voice command through Hermes."""
-    _LOGGER.info("HA request: session=%s text=%r", request.session_id, request.text[:80])
-    sessions = _load_sessions()
-    sid = request.session_id or "default"
-
-    # Load or initialize session state
-    session = sessions.get(sid, {})
-    if isinstance(session, str):
-        # Legacy format — migrate
-        session = {"resume": session, "turns": 0}
-
-    resume = session.get("resume") if isinstance(session, dict) else None
-    turns = session.get("turns", 0) if isinstance(session, dict) else 0
-    reset = False
-
-    # Auto-reset if over turn limit
-    if turns >= MAX_TURNS:
-        _LOGGER.info("Session %s: %d turns, auto-resetting", sid, turns)
-        resume = None
-        turns = 0
-        reset = True
-
+    """Process a voice command through Hermes one-shot mode."""
+    _LOGGER.info("HA request: text=%r", request.text[:80])
     try:
-        response_text, new_session = await _hermes_chat(request.text, resume)
-
-        # Store updated session
-        if new_session:
-            sessions[sid] = {"resume": new_session, "turns": turns + 1}
-            _save_sessions(sessions)
-
-        return ChatResponse(
-            response=response_text,
-            session_id=sid,
-            turn=turns + 1,
-            max_turns=MAX_TURNS,
-            reset=reset,
-        )
-
+        response_text = await _hermes_oneshot(request.text)
+        return ChatResponse(response=response_text)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -150,12 +74,3 @@ async def chat(request: ChatRequest) -> ChatResponse:
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
-
-@app.get("/reset/{session_id}")
-async def reset_session(session_id: str):
-    """Clear conversation history for a session."""
-    sessions = _load_sessions()
-    sessions.pop(session_id, None)
-    _save_sessions(sessions)
-    return {"status": "cleared"}
